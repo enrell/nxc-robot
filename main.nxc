@@ -1,0 +1,506 @@
+// ==========================
+// OBR Resgate NXT — Template
+// ==========================
+// Autor: Ênrell
+// --------------------------
+
+// ---------- CALIBRAÇÃO & HARDWARE ----------
+#define PORT_LIGHT_RIGHT IN_1
+#define PORT_LIGHT_LEFT  IN_4
+#define PORT_COLOR       IN_2
+#define PORT_US          IN_3
+
+#define M_LEFT  OUT_A
+#define M_RIGHT OUT_B
+#define M_SHOVEL OUT_C
+#define M_DRIVE OUT_AB
+
+// Geometria (mm)
+#define WHEEL_DIAMETER_MM 56     // diâmetro roda
+#define TRACK_MM          120    // distância entre rodas (eixo a eixo)
+
+// Velocidades (%)
+#define V_LINE_BASE_FAST 85
+#define V_LINE_BASE_SLOW 50
+#define V_TURN            55
+#define V_DRIVE_SWEEP     70
+#define V_PERIM           60
+#define V_APPROACH        40      // aproximação de vítima/depósito
+#define V_TURN_FINE       40
+
+// PID linha
+#define KP_LINE     0.80
+#define KD_LINE     3.50
+#define CURVE_TRIG  8       // |Δerro| acima disso => modo Curva
+#define CURVE_HOLD  4       // ciclos para manter Curva antes de voltar ao Reto
+
+// Limiares de luz (ajuste no local)
+#define TH_BLACK      40    // abaixo disso = preto
+#define TH_WHITE      60    // acima disso = branco
+#define TH_SILVER     80    // brilho/reflexo alto (fita prateada)
+#define TH_EXIT_BLACK 30    // fita preta na saída
+
+// Cor (IDs do NXT Color Sensor)
+#define USE_COLOR_ID 1      // 1 = usa ColorSensor(PORT_COLOR); 0 = usa brilho Sensor(PORT_COLOR)
+#define COL_BLACK  1
+#define COL_BLUE   2
+#define COL_GREEN  3
+#define COL_YELLOW 4
+#define COL_RED    5
+#define COL_WHITE  6
+#define COL_BROWN  7
+
+// Classificação vítimas (modo ID + brilho)
+#define SILVER_IS_WHITE_ID 1     // prateada geralmente lida como "WHITE"
+#define BRIGHT_MIN_SILVER  75    // brilho % mínimo para considerar "prateada"
+#define DARK_MAX_BLACK     45    // brilho % máximo para "preta"
+
+// Ultrassom (cm)
+#define US_OBS_AHEAD_CM   30     // obstáculo no trajeto
+#define US_WALL_PERIM_CM  11     // distância alvo parede no perímetro
+#define US_WALL_MIN_CM     7     // muito perto da parede
+#define US_ROOM_FRONT_CM  18     // presença frontal genérica
+#define US_VICTIM_LOCK_CM  6     // travar captura
+
+// Varredura (S)
+#define SWEEP_STEP_MM     120    // passo lateral entre faixas (~largura do funil)
+#define SWEEP_WALL_STOP   12     // parar a ~12 cm da parede
+#define ROOM_TIMEOUT_MS  60000   // tempo máximo dentro da sala
+#define MAX_VICTIMS        3
+
+// Depósito
+#define DEPOSIT_OPEN_MS   600    // "giro extra" mecânico
+#define RETURN_HEADING_OK 10     // tolerância angular ao retornar para faixa (graus)
+
+// Diversos
+#define LOOP_DT_MS         20    // período do loop principal
+#define SILVER_TAPE_HITS    3    // leituras altas consecutivas para confirmação fita prateada
+#define BLACK_TAPE_HITS     3
+
+// ---------- ESTADO & DADOS ----------
+typedef struct {
+  long t0;                 // timestamp ms
+  int  encL, encR;         // contadores absolutos deg
+  int  encL_prev, encR_prev;
+  float x, y, th_deg;      // pose (mm, mm, graus)
+} Odo;
+
+typedef struct {
+  int lLeft, lRight;       // luz esquerda/direita
+  int colId;               // id de cor
+  int colBright;           // brilho porta cor
+  int us;                  // ultrassom cm
+} Sns;
+
+typedef enum {
+  ST_LINE=0, ST_OBS_AVOID,
+  ST_ROOM_PERIM, ST_SWEEP,
+  ST_ACQUIRE, ST_CLASSIFY,
+  ST_GOTO_BIN, ST_DEPOSIT, ST_EXIT
+} State;
+
+typedef struct {
+  bool inRoom;
+  bool haveVictim;
+  bool victimIsSilver;     // viva
+  int  victimsDone;
+  long roomT0;
+  // bins
+  bool binGreenSeen, binRedSeen;
+  float binGreenX, binGreenY;
+  float binRedX,   binRedY;
+  // sweep
+  bool sweepDirForward;    // alterna ida/volta nas faixas
+  float lastSweepX, lastSweepY, lastSweepTh;
+  // helpers
+  int curveHold;
+  int silverHits, blackHits;
+} Run;
+
+// Globais
+Odo gOdo;
+Sns gSns;
+Run gRun;
+State gSt = ST_LINE;
+
+// ---------- UTIL ----------
+int clamp(int v, int lo, int hi){ if(v<lo) return lo; if(v>hi) return hi; return v; }
+float deg2rad(float d){ return d*3.1415926/180.0; }
+float rad2deg(float r){ return r*180.0/3.1415926; }
+long now(){ return CurrentTick(); }
+
+// ---------- MOTORES ----------
+void motorsStop(){ Off(OUT_ABC); }
+void motorsSet(int pL, int pR){ OnFwd(M_LEFT, clamp(pL,-100,100)); OnFwd(M_RIGHT, clamp(pR,-100,100)); }
+
+// Movimento por distância/ângulo (odometria de encoders)
+void resetEnc(){ ResetRotationCount(M_LEFT); ResetRotationCount(M_RIGHT); }
+int encL(){ return MotorRotationCount(M_LEFT); }
+int encR(){ return MotorRotationCount(M_RIGHT); }
+
+void driveDistanceMM(int mm, int pwr){
+  int targetDeg = (int)((360.0 * mm) / (3.1415926 * WHEEL_DIAMETER_MM));
+  resetEnc();
+  if(mm>=0){ OnFwd(M_DRIVE, pwr); } else { OnRev(M_DRIVE, pwr); targetDeg = -targetDeg; }
+  while( ((encL()+encR())/2) < targetDeg ) { Wait(5); }
+  motorsStop();
+}
+
+void turnDegrees(int ang, int pwr){
+  // giro no lugar: deg_roda = ang * TRACK_MM / WHEEL_DIAMETER_MM
+  int wheelDeg = (int)( (float)ang * (float)TRACK_MM / (float)WHEEL_DIAMETER_MM );
+  resetEnc();
+  if(ang>0){ // CCW: esquerda trás, direita frente
+    OnRev(M_LEFT, pwr); OnFwd(M_RIGHT, pwr);
+    while( (-encL() + encR())/2 < wheelDeg ) { Wait(5); }
+  } else {
+    ang = -ang; wheelDeg = -wheelDeg;
+    OnFwd(M_LEFT, pwr); OnRev(M_RIGHT, pwr);
+    while( (encL() - encR())/2 < -wheelDeg ) { Wait(5); }
+  }
+  motorsStop();
+}
+
+// ---------- SENSORES ----------
+void initSensors(){
+  SetSensorLight(PORT_LIGHT_RIGHT);
+  SetSensorLight(PORT_LIGHT_LEFT);
+  SetSensorColorFull(PORT_COLOR);     // cor + brilho
+  SetSensorUltrasonic(PORT_US);
+}
+
+void readSensors(){
+  gSns.lRight = Sensor(PORT_LIGHT_RIGHT);
+  gSns.lLeft  = Sensor(PORT_LIGHT_LEFT);
+  #if USE_COLOR_ID
+    gSns.colId = ColorSensor(PORT_COLOR);
+  #else
+    gSns.colId = 0;
+  #endif
+  gSns.colBright = Sensor(PORT_COLOR); // usa brilho para prateado/fitas
+  gSns.us = SensorUS(PORT_US);
+}
+
+// ---------- ODOMETRIA ----------
+void initOdo(){
+  gOdo.x=0; gOdo.y=0; gOdo.th_deg=0;
+  gOdo.encL=gOdo.encR=gOdo.encL_prev=gOdo.encR_prev=0;
+  gOdo.t0 = now();
+  resetEnc();
+}
+
+void updateOdo(){
+  gOdo.encL = encL();
+  gOdo.encR = encR();
+  int dL = gOdo.encL - gOdo.encL_prev;
+  int dR = gOdo.encR - gOdo.encR_prev;
+  gOdo.encL_prev = gOdo.encL;
+  gOdo.encR_prev = gOdo.encR;
+  float mmL = (3.1415926 * WHEEL_DIAMETER_MM * dL) / 360.0;
+  float mmR = (3.1415926 * WHEEL_DIAMETER_MM * dR) / 360.0;
+  float dC = (mmL + mmR)/2.0;
+  float dTh = rad2deg( (mmR - mmL)/TRACK_MM );
+  gOdo.th_deg += dTh;
+  // normaliza -180..180
+  if(gOdo.th_deg>180) gOdo.th_deg-=360; if(gOdo.th_deg<-180) gOdo.th_deg+=360;
+  float thRad = deg2rad(gOdo.th_deg);
+  gOdo.x += dC * Cos(thRad);
+  gOdo.y += dC * Sin(thRad);
+}
+
+void resetLocalFrame(){
+  gOdo.x=0; gOdo.y=0; gOdo.th_deg=0;
+  resetEnc();
+  gOdo.encL_prev=encL(); gOdo.encR_prev=encR();
+}
+
+// ---------- DETECÇÕES ----------
+bool isBlackBoth(){ return (gSns.lLeft < TH_BLACK && gSns.lRight < TH_BLACK); }
+bool silverTapeDetected(){
+  if(gSns.colBright >= TH_SILVER) gRun.silverHits++; else gRun.silverHits=0;
+  return gRun.silverHits >= SILVER_TAPE_HITS;
+}
+bool blackTapeDetected(){
+  if(gSns.lLeft <= TH_EXIT_BLACK && gSns.lRight <= TH_EXIT_BLACK) gRun.blackHits++; else gRun.blackHits=0;
+  return gRun.blackHits >= BLACK_TAPE_HITS;
+}
+bool obstacleAhead(){ return (gSns.us>0 && gSns.us <= US_OBS_AHEAD_CM); }
+
+bool greenOnFloor(){
+  #if USE_COLOR_ID
+    return (gSns.colId == COL_GREEN);
+  #else
+    return 0;
+  #endif
+}
+bool redOnFloor(){
+  #if USE_COLOR_ID
+    return (gSns.colId == COL_RED);
+  #else
+    return 0;
+  #endif
+}
+
+// Vítima: presença US + classificação por brilho/cor
+bool victimInFront(){ return (gSns.us>0 && gSns.us <= US_ROOM_FRONT_CM); }
+bool classifyIsSilver(){
+  // Estratégia: se ID = WHITE e brilho alto => prateada; se brilho alto sem ID, também
+  #if USE_COLOR_ID
+    if(gSns.colId == COL_WHITE && gSns.colBright >= BRIGHT_MIN_SILVER) return true;
+  #endif
+  if(gSns.colBright >= BRIGHT_MIN_SILVER) return true;
+  if(gSns.colBright <= DARK_MAX_BLACK) return false;
+  // fallback: se não claro, prefira considerar preta apenas se muito escuro
+  return false;
+}
+
+// ---------- LINHA (PID 2-modos) ----------
+void lineFollowTurbo(){
+  static int prevErr=0, modeCurve=0, hold=0;
+
+  int err = gSns.lRight - gSns.lLeft;
+  int dErr = err - prevErr; prevErr = err;
+
+  // Mode switching
+  if (Abs(dErr) > CURVE_TRIG) { modeCurve=1; hold=CURVE_HOLD; }
+  else if (hold>0) { hold--; if(hold==0) modeCurve=0; }
+
+  int base = modeCurve ? V_LINE_BASE_SLOW : V_LINE_BASE_FAST;
+  int u = (int)(KP_LINE*err + KD_LINE*dErr);
+
+  int pL = clamp(base + u, -100, 100);
+  int pR = clamp(base - u, -100, 100);
+  motorsSet(pL, pR);
+}
+
+// ---------- DESVIO CURTO ----------
+void doBypassManeuver(){
+  motorsStop();
+  // 45° direita, 25 cm, 45° esquerda, 25 cm
+  turnDegrees(-45, V_TURN);
+  driveDistanceMM(250, V_LINE_BASE_SLOW);
+  turnDegrees(45, V_TURN);
+  driveDistanceMM(250, V_LINE_BASE_SLOW);
+}
+
+// ---------- SALA: PERÍMETRO ----------
+void followWallAndScanBins(){
+  // controle P simples mantendo ~US_WALL_PERIM_CM
+  int err = 0;
+  if(gSns.us>0) err = (US_WALL_PERIM_CM - gSns.us); // + se longe demais (aproxima)
+  int corr = err * 6; // ganho pequeno -> converta cm para potência
+
+  int pL = clamp(V_PERIM - corr, -100, 100);
+  int pR = clamp(V_PERIM + corr, -100, 100);
+
+  // Evitar choque se muito perto
+  if(gSns.us>0 && gSns.us <= US_WALL_MIN_CM){
+    pL = -V_TURN_FINE; pR = V_TURN_FINE; // afasta
+  }
+  motorsSet(pL, pR);
+
+  // Scan bins no chão
+  if(greenOnFloor()){
+    gRun.binGreenSeen=true; gRun.binGreenX=gOdo.x; gRun.binGreenY=gOdo.y;
+  }
+  if(redOnFloor()){
+    gRun.binRedSeen=true; gRun.binRedX=gOdo.x; gRun.binRedY=gOdo.y;
+  }
+}
+
+// ---------- SALA: VARREDURA "S" ----------
+void prepareSweep(){
+  gRun.sweepDirForward = true;
+  gRun.lastSweepX = gOdo.x; gRun.lastSweepY = gOdo.y; gRun.lastSweepTh = gOdo.th_deg;
+}
+
+void sweepStep(){
+  // Avança até parede (US ~ SWEEP_WALL_STOP)
+  if(gSns.us>0 && gSns.us <= SWEEP_WALL_STOP){
+    motorsStop();
+    // COTOVELO: vira 90, anda passo, vira 90, inverte direção
+    if(gRun.sweepDirForward){
+      turnDegrees(90, V_TURN);
+      driveDistanceMM(SWEEP_STEP_MM, V_DRIVE_SWEEP);
+      turnDegrees(90, V_TURN);
+      gRun.sweepDirForward=false;
+    } else {
+      turnDegrees(-90, V_TURN);
+      driveDistanceMM(SWEEP_STEP_MM, V_DRIVE_SWEEP);
+      turnDegrees(-90, V_TURN);
+      gRun.sweepDirForward=true;
+    }
+    return;
+  }
+  // Caso normal: seguir reto varrendo
+  motorsSet(V_DRIVE_SWEEP, V_DRIVE_SWEEP);
+}
+
+// ---------- VÍTIMA: AQUISIÇÃO & CLASSIFICAÇÃO ----------
+bool captureVictim(){
+  // aproximação lenta até colidir dentro do funil (US <= lock)
+  motorsSet(V_APPROACH, V_APPROACH);
+  long t0 = now();
+  while( now() - t0 < 2500 ){
+    readSensors();
+    if(gSns.us>0 && gSns.us <= US_VICTIM_LOCK_CM) { motorsStop(); return true; }
+    Wait(10);
+  }
+  motorsStop();
+  return false;
+}
+
+void classifyVictim(){
+  // "sacudir" levemente a pá para mudar ângulo e reler brilho
+  OnRev(M_SHOVEL, 40); Wait(180);
+  OnFwd(M_SHOVEL, 40); Wait(180);
+  readSensors();
+  gRun.victimIsSilver = classifyIsSilver();
+  gRun.haveVictim = true;
+}
+
+// ---------- DEPOSITO: PLANEJAMENTO LOCAL ----------
+float sqr(float x){ return x*x; }
+float dist2(float x1,float y1,float x2,float y2){ return sqr(x1-x2)+sqr(y1-y2); }
+
+bool chooseBinAndHead(){
+  // retorna true se existe alvo; gira heading aproximado
+  if(gRun.victimIsSilver && gRun.binGreenSeen){
+    // vire em direção ao bin verde (heurística: aprox. virar 90 e andar se alinhado)
+    return true;
+  }
+  if(!gRun.victimIsSilver && gRun.binRedSeen){
+    return true;
+  }
+  return false;
+}
+
+bool atBin(){
+  // condição simples: detectar a cor correta no chão
+  if(gRun.victimIsSilver) return greenOnFloor();
+  else return redOnFloor();
+}
+
+void gotoBinStep(){
+  // Estratégia simples: avance em frente até detectar a cor correta;
+  // se longe de parede, gire varrendo
+  if(gRun.victimIsSilver){
+    // priorize encontrar verde
+    motorsSet(V_APPROACH, V_APPROACH);
+  } else {
+    motorsSet(V_APPROACH, V_APPROACH);
+  }
+}
+
+// ---------- DEPÓSITO ----------
+void depositVictim(){
+  motorsStop();
+  // acionar mecanismo
+  OnFwd(M_SHOVEL, 60); Wait(DEPOSIT_OPEN_MS);
+  Off(M_SHOVEL);
+  gRun.haveVictim=false;
+  gRun.victimsDone++;
+  // pequeno recuo
+  driveDistanceMM(-80, V_APPROACH);
+}
+
+// ---------- SAÍDA ----------
+void headToExit(){
+  // Estratégia simples: procurar fita preta
+  motorsSet(V_LINE_BASE_SLOW, V_LINE_BASE_SLOW);
+}
+
+// ---------- MAIN ----------
+task main(){
+  initSensors();
+  initOdo();
+
+  // Estado inicial
+  gRun.inRoom=false; gRun.haveVictim=false; gRun.victimsDone=0;
+  gRun.binGreenSeen=gRun.binRedSeen=false;
+  gRun.curveHold=0; gRun.silverHits=gRun.blackHits=0;
+
+  long lastLoop = now();
+
+  while(true){
+    // loop base
+    readSensors();
+    updateOdo();
+
+    switch(gSt){
+
+      case ST_LINE:
+        if(silverTapeDetected()){ // entrada da sala
+          motorsStop();
+          gRun.inRoom=true; gRun.roomT0=now();
+          resetLocalFrame();
+          gSt = ST_ROOM_PERIM;
+          break;
+        }
+        if(obstacleAhead()){ gSt = ST_OBS_AVOID; break; }
+        lineFollowTurbo();
+        break;
+
+      case ST_OBS_AVOID:
+        doBypassManeuver();
+        gSt = ST_LINE;
+        break;
+
+      case ST_ROOM_PERIM:
+        // uma volta (ou até acharmos os dois bins), depois varredura
+        followWallAndScanBins();
+        if( (gRun.binGreenSeen && gRun.binRedSeen) || (now()-gRun.roomT0> 8000) ){
+          motorsStop();
+          prepareSweep();
+          gSt = ST_SWEEP;
+        }
+        break;
+
+      case ST_SWEEP:
+        if( (now()-gRun.roomT0) > ROOM_TIMEOUT_MS || gRun.victimsDone>=MAX_VICTIMS ){
+          gSt = ST_EXIT; motorsStop(); break;
+        }
+        if(victimInFront()){ motorsStop(); gSt = ST_ACQUIRE; break; }
+        sweepStep();
+        break;
+
+      case ST_ACQUIRE:
+        if(captureVictim()) gSt = ST_CLASSIFY; else gSt = ST_SWEEP;
+        break;
+
+      case ST_CLASSIFY:
+        classifyVictim();
+        // se já temos alvo conhecido, vai direto; senão continua andando até encontrar
+        gSt = ST_GOTO_BIN;
+        break;
+
+      case ST_GOTO_BIN:
+        if(atBin()){ gSt = ST_DEPOSIT; break; }
+        gotoBinStep();
+        break;
+
+      case ST_DEPOSIT:
+        depositVictim();
+        // retornar para varredura: pequeno giro alternado para “achatar” o S
+        turnDegrees( gRun.sweepDirForward ? -90 : 90, V_TURN_FINE );
+        motorsStop();
+        gSt = ST_SWEEP;
+        break;
+
+      case ST_EXIT:
+        // procurar fita preta e voltar ao seguidor de linha
+        if(blackTapeDetected()){
+          gRun.inRoom=false;
+          gSt = ST_LINE;
+          break;
+        }
+        headToExit();
+        break;
+    }
+
+    // pacing do loop
+    long dt = now()-lastLoop;
+    if(dt < LOOP_DT_MS) Wait(LOOP_DT_MS - dt);
+    lastLoop = now();
+  }
+}
